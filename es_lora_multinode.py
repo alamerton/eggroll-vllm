@@ -53,11 +53,29 @@ class Args:
     max_tokens: int = 1024
     temperature: float = 0.0
     samples_per_prompt: int = 1
-    task: str = "zeros"  # Options: "zeros", "countdown", "math:deepscaler40k", ...
+    task: str = "zeros"  # Options: "zeros", "countdown", "math:deepscaler40k", "tldr_preference", ...
     prompt_batch_size: int = 2
     pass_at_k: bool = False
     normalize_with_std: bool = False
     scale_lr_in_grad: bool = False
+
+    # --- Preference tasks (task="tldr_preference") ---
+    preference_objective: str = "maxlot"  # "naive", "maxlot", "ipo", "dpo" or "cross"
+    # Within-pair softmax for the maxlot margin (sound sequence-level
+    # pi; immune to uniform confidence inflation).
+    pair_normalise: bool = False
+    judge_model: str = "OpenAssistant/reward-model-deberta-v3-base"
+    judge_mode: str = "bernoulli"  # "soft", "hard" or "bernoulli"
+    judge_device: str = "cpu"  # the vLLM engine usually owns the GPU memory
+    ipo_tau_inv: float = 100.0
+    dpo_beta: float = 0.1
+    # Where the frozen initial-weights copy (the ipo/dpo reference)
+    # runs. "cuda" needs headroom next to the vLLM engine; lower the
+    # engine's gpu_memory_utilization or use "cpu" if it OOMs.
+    ref_device: str = "cuda"
+    # vLLM's share of GPU memory. Lower it (e.g. 0.7) when the judge
+    # and/or the frozen reference copy run on the same GPU.
+    gpu_memory_utilization: float = 0.9
 
     # --- LoRA Config ---
     lora_r: int = 4
@@ -746,10 +764,20 @@ class ESNcclLLM(LLM):
         
         return adapter_paths
     
-    def generate_and_score(self, prompts, sampling_params, lora_requests, task_obj, answers, args):
+    def generate_and_score(self, prompts, sampling_params, lora_requests, task_obj, answers, args, es_step=0):
         """
         Generates responses AND calculates fitness/stats on the GPU worker.
         """
+        # Preference tasks (pairwise judge, no ground-truth answer) take
+        # a separate path; see generate_and_score_preference.
+        if getattr(task_obj, "cross_pairs", False):
+            return self.generate_and_score_cross(
+                prompts, sampling_params, lora_requests, task_obj, answers, args, es_step
+            )
+        if getattr(task_obj, "is_preference", False):
+            return self.generate_and_score_preference(
+                prompts, sampling_params, lora_requests, task_obj, answers, args, es_step
+            )
         # Debug: Check if LoRA requests are being passed
         if lora_requests is not None:
             if isinstance(lora_requests, list) and len(lora_requests) > 0:
@@ -888,6 +916,304 @@ class ESNcclLLM(LLM):
 
         return fitness_list, info, responses_for_logging
 
+    def _frozen_ref_logprobs(self, token_id_seqs, response_spans, args):
+        """Summed response-token log-probs under the FROZEN INITIAL weights.
+
+        The vLLM engine's own weights have ES updates merged in every
+        step, so they cannot serve as the ipo/dpo reference; instead a
+        plain HF copy of the starting checkpoint is lazily loaded once
+        per actor ("just create a copy") and teacher-forces the
+        response span. Token-id based, so spans are exact.
+        """
+        import torch
+
+        if getattr(self, "_ref_model", None) is None:
+            from transformers import AutoModelForCausalLM
+
+            device = getattr(args, "ref_device", "cuda")
+            print(f"REF: loading frozen reference copy of {args.model_name} on {device}", flush=True)
+            self._ref_device = torch.device(device)
+            self._ref_model = (
+                AutoModelForCausalLM.from_pretrained(
+                    args.model_name, torch_dtype=torch.bfloat16
+                )
+                .to(self._ref_device)
+                .eval()
+            )
+
+        scores = []
+        batch = 4  # vocab-sized logits dominate memory; keep batches small
+        pos_chunk = 128  # f32 log-softmax in position slices, not full-seq
+        with torch.no_grad():
+            for start in range(0, len(token_id_seqs), batch):
+                chunk = token_id_seqs[start : start + batch]
+                spans = response_spans[start : start + batch]
+                max_len = max(len(s) for s in chunk)
+                ids = torch.zeros(len(chunk), max_len, dtype=torch.long)
+                mask = torch.zeros(len(chunk), max_len, dtype=torch.long)
+                for j, seq in enumerate(chunk):
+                    ids[j, : len(seq)] = torch.tensor(seq, dtype=torch.long)
+                    mask[j, : len(seq)] = 1
+                ids = ids.to(self._ref_device)
+                mask = mask.to(self._ref_device)
+                logits = self._ref_model(input_ids=ids, attention_mask=mask).logits
+                # Full-sequence f32 log-softmax at a ~150k vocab is
+                # gigabytes; slice over positions instead.
+                token_lps = torch.zeros(
+                    ids.shape[0], ids.shape[1] - 1, device=self._ref_device
+                )
+                for p in range(0, ids.shape[1] - 1, pos_chunk):
+                    sl = logits[:, p : p + pos_chunk].float()
+                    width = min(pos_chunk, ids.shape[1] - 1 - p)
+                    lp = torch.log_softmax(sl[:, :width], dim=-1)
+                    tgt = ids[:, p + 1 : p + 1 + width]
+                    token_lps[:, p : p + width] = lp.gather(
+                        -1, tgt.unsqueeze(-1)
+                    ).squeeze(-1)
+                del logits
+                for j, seq in enumerate(chunk):
+                    length, span = len(seq), spans[j]
+                    if span > 0:
+                        # Response tokens sit at ids[L-span:L]; the logits
+                        # predicting them are positions L-span-1 .. L-2.
+                        scores.append(
+                            float(token_lps[j, length - 1 - span : length - 1].sum())
+                        )
+                    else:
+                        scores.append(0.0)
+        return scores
+
+    def generate_and_score_cross(self, prompts, sampling_params, lora_requests, task_obj, answers, args, es_step=0):
+        """Cross-antithetic preference scoring (Roberto's prose scheme).
+
+        Each population member generates ONE response (n=1); responses
+        are paired across antithetic twins (global pop ids 2k = +sigma,
+        2k+1 = -sigma share the noise with opposite sign), the judge
+        compares twin 2k's response a against twin 2k+1's response b,
+        and the pair fitness f = s * pi+(a) * pi-(b) is broadcast as
+        [f, -f] to the (+, -) twins. Returns the standard
+        (fitness_list, info, responses_for_logging) shape.
+        """
+        request_outputs = self.generate(
+            prompts,
+            sampling_params,
+            lora_request=lora_requests,
+            use_tqdm=True,
+        )
+
+        num_prompts = len(answers)
+        n_local = len(request_outputs) // num_prompts
+        assert n_local % 2 == 0, (
+            f"cross objective needs an even number of members per engine, got {n_local}"
+        )
+        # Twins must be co-located and adjacent: recover global pop ids
+        # from the lora ids (pop_id + 1 + es_step * 10000).
+        if lora_requests is not None and len(lora_requests) > 0:
+            gids = [
+                (lora_requests[m * num_prompts].lora_int_id - 1) % 10000
+                for m in range(n_local)
+            ]
+            for k in range(0, n_local, 2):
+                assert gids[k] % 2 == 0 and gids[k + 1] == gids[k] + 1, (
+                    f"cross objective needs adjacent (+,-) twins per engine; got ids {gids}"
+                )
+
+        fitness_list = [0.0] * len(request_outputs)
+        responses_for_logging = []
+        all_task_info = {}
+        total_responses = 0
+        num_truncated = 0
+        mean_char_lengths = []
+        mean_token_lengths = []
+
+        for k in range(0, n_local, 2):
+            for j in range(num_prompts):
+                out_a = request_outputs[k * num_prompts + j]
+                out_b = request_outputs[(k + 1) * num_prompts + j]
+                assert len(out_a.outputs) == 1 and len(out_b.outputs) == 1, (
+                    "cross objective needs samples_per_prompt=1"
+                )
+                a, b = out_a.outputs[0], out_b.outputs[0]
+                key = (args.base_seed, es_step, j, a.text, b.text)
+                fit, task_info = task_obj.get_fitness_cross(
+                    prompts[k * num_prompts + j],
+                    a.text,
+                    b.text,
+                    [a.finish_reason == "length", b.finish_reason == "length"],
+                    a.cumulative_logprob,
+                    len(a.token_ids),
+                    b.cumulative_logprob,
+                    len(b.token_ids),
+                    key,
+                )
+                fitness_list[k * num_prompts + j] = fit
+                fitness_list[(k + 1) * num_prompts + j] = -fit
+
+                for key_name, v in task_info.items():
+                    all_task_info.setdefault(key_name, []).append(v)
+                num_truncated += (a.finish_reason == "length") + (
+                    b.finish_reason == "length"
+                )
+                total_responses += 2
+                mean_char_lengths.append((len(a.text) + len(b.text)) / 2.0)
+                mean_token_lengths.append(
+                    (len(a.token_ids) + len(b.token_ids)) / 2.0
+                )
+                if k < 2 and j < 3:
+                    responses_for_logging.append(
+                        f"-----TWIN PAIR {k//2} PROMPT {j}-----\n"
+                        f"[+sigma]: {a.text}\n[-sigma]: {b.text} || FIT={fit}\n"
+                    )
+
+        info = {
+            "total_responses": total_responses,
+            "prop_truncated": num_truncated / total_responses if total_responses > 0 else 0.0,
+            "mean_char_length": np.mean(mean_char_lengths),
+            "mean_token_length": np.mean(mean_token_lengths),
+        }
+        for key_name, v in all_task_info.items():
+            info[key_name] = float(np.mean(v))
+
+        return fitness_list, info, responses_for_logging
+
+    def generate_and_score_preference(self, prompts, sampling_params, lora_requests, task_obj, answers, args, es_step=0):
+        """Pairwise-preference variant of generate_and_score.
+
+        Each request samples n=2 responses (a, b) under the member's
+        adapter; the task's judge prefers one side and
+        get_fitness_pairwise turns (preference, log-probs) into one
+        fitness per (pop, prompt). For objectives that need them
+        (maxlot), each response is also scored under the unperturbed
+        base weights (no adapter) -- the frozen current policy, since
+        ES updates are merged into the base every step. Returns the
+        same (fitness_list, info, responses_for_logging) shape as the
+        scalar path, so the caller's aggregation is unchanged.
+        """
+        request_outputs = self.generate(
+            prompts,
+            sampling_params,
+            lora_request=lora_requests,
+            use_tqdm=True,
+        )
+
+        num_prompts = len(answers)
+
+        # Optional second passes: score the generated responses under
+        # the unperturbed *current* base (maxlot's pibar, via the engine
+        # with no adapter) and/or the FROZEN INITIAL weights (ipo/dpo's
+        # reference, via the actor's frozen HF copy). Built from token
+        # ids (not re-tokenised text) so the response span is exact.
+        needs_base = getattr(task_obj, "needs_base_scores", False)
+        needs_ref = getattr(task_obj, "needs_ref_scores", False)
+        base_scores, ref_scores = None, None
+        if needs_base or needs_ref:
+            token_id_seqs, response_spans = [], []
+            for output in request_outputs:
+                prompt_ids = list(output.prompt_token_ids)
+                for o in output.outputs:
+                    response_ids = list(o.token_ids)
+                    token_id_seqs.append(prompt_ids + response_ids)
+                    response_spans.append(len(response_ids))
+        if needs_base:
+            from vllm import TokensPrompt
+
+            score_params = SamplingParams(
+                temperature=0.0, max_tokens=1, prompt_logprobs=0
+            )
+            score_prompts = [
+                TokensPrompt(prompt_token_ids=seq) for seq in token_id_seqs
+            ]
+            score_outputs = self.generate(
+                score_prompts, score_params, lora_request=None, use_tqdm=False
+            )
+            base_scores = []
+            for out, span in zip(score_outputs, response_spans):
+                total = 0.0
+                if span > 0:
+                    # prompt_logprobs[k] maps the actual token at k to its
+                    # Logprob (None at position 0); the response occupies
+                    # the last `span` positions.
+                    for entry in out.prompt_logprobs[-span:]:
+                        if entry:
+                            total += next(iter(entry.values())).logprob
+                base_scores.append(total)
+        if needs_ref:
+            ref_scores = self._frozen_ref_logprobs(token_id_seqs, response_spans, args)
+
+        fitness_list = []
+        responses_for_logging = []
+        all_task_info = {}
+        total_responses = 0
+        num_truncated = 0
+        mean_char_lengths = []
+        mean_token_lengths = []
+        pop_responses_buffer = ""
+
+        for i, output in enumerate(request_outputs):
+            prompt_idx = i % num_prompts
+            pop_idx = i // num_prompts
+
+            outs = output.outputs
+            assert len(outs) == 2, (
+                f"preference tasks need n=2 samples per request, got {len(outs)}"
+            )
+            responses = [o.text for o in outs]
+            truncateds = [o.finish_reason == "length" for o in outs]
+            gen_logprobs = [o.cumulative_logprob for o in outs]
+            gen_token_lens = [len(o.token_ids) for o in outs]
+            pair_base_scores = (
+                base_scores[2 * i : 2 * i + 2] if base_scores is not None else None
+            )
+            pair_ref_scores = (
+                ref_scores[2 * i : 2 * i + 2] if ref_scores is not None else None
+            )
+            # Deterministic bernoulli key: content-based, so it is unique
+            # per pair and reproducible without coupling to adapter ids.
+            key = (args.base_seed, es_step, prompt_idx, responses[0], responses[1])
+
+            fit, task_info = task_obj.get_fitness_pairwise(
+                prompts[i],
+                responses,
+                truncateds,
+                gen_logprobs,
+                gen_token_lens,
+                pair_base_scores,
+                pair_ref_scores,
+                key,
+            )
+            fitness_list.append(fit)
+
+            for k, v in task_info.items():
+                all_task_info.setdefault(k, []).append(v)
+
+            num_truncated += sum(truncateds)
+            total_responses += len(outs)
+            mean_char_lengths.append(np.mean([len(r) for r in responses]))
+            mean_token_lengths.append(np.mean(gen_token_lens))
+
+            if pop_idx < 2 and prompt_idx < 3:
+                pop_responses_buffer += (
+                    f"\n[PROMPT {prompt_idx}]: {prompts[i]}\n"
+                    f"\n------SAMPLE A: {responses[0]}\n"
+                    f"\n------SAMPLE B: {responses[1]} || FIT={fit}\n"
+                )
+            if (i + 1) % num_prompts == 0 and pop_responses_buffer != "":
+                responses_for_logging.append(
+                    f"-----POP {pop_idx} BATCH LOG-----\n" + pop_responses_buffer
+                )
+                pop_responses_buffer = ""
+
+        info = {
+            "total_responses": total_responses,
+            "prop_truncated": num_truncated / total_responses if total_responses > 0 else 0.0,
+            "mean_char_length": np.mean(mean_char_lengths),
+            "mean_token_length": np.mean(mean_token_lengths),
+        }
+        for k, v in all_task_info.items():
+            info[k] = float(np.mean(v))
+
+        return fitness_list, info, responses_for_logging
+
 def launch_engines(num_engines, model_name, population_size, lora_r, tensor_parallel_size=1, max_tokens=1024):
     """Launches multiple vLLM engines via Ray Placement Groups.
 
@@ -948,7 +1274,7 @@ def launch_engines(num_engines, model_name, population_size, lora_r, tensor_para
         else:
             max_num_seqs = 512
             max_num_batched_tokens = 8 * args.max_tokens
-            gpu_mem_util = 0.9
+            gpu_mem_util = args.gpu_memory_utilization
 
         engines = [
             ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(ESNcclLLM).remote(
@@ -1004,7 +1330,7 @@ def launch_engines(num_engines, model_name, population_size, lora_r, tensor_para
             enable_lora=True,
             max_loras=(population_size + num_engines - 1) // num_engines,
             max_lora_rank=max(lora_r, 8),
-            gpu_memory_utilization=0.90,  # conservative to reduce overall memory pressure
+            gpu_memory_utilization=args.gpu_memory_utilization,
             trust_remote_code=True,
             max_num_seqs=512,  # allows parallel processing of up to 512 sequences per engine for higher throughput
             max_model_len=max(1024, 512 + max_tokens),  # dynamic based on generation length
@@ -1158,8 +1484,13 @@ def main(args: Args):
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
         print("MAIN: WandB initialized", flush=True)
         sys.stdout.flush()
-        weave.init(args.wandb_project)
-        print("MAIN: Weave initialized", flush=True)
+        try:
+            # weave hard-requires a wandb login even when wandb itself
+            # runs offline; it is tracing sugar, never load-bearing.
+            weave.init(args.wandb_project)
+            print("MAIN: Weave initialized", flush=True)
+        except Exception as exc:
+            print(f"MAIN: Weave disabled ({exc})", flush=True)
         sys.stdout.flush()
 
     # Setup checkpoint directory
@@ -1293,16 +1624,47 @@ def main(args: Args):
             seed=args.base_seed,
             answer_format="boxed",
         )
+    elif args.task == "tldr_preference":
+        from preference_tasks import TldrPreferenceTask
+        task = TldrPreferenceTask(
+            batch_size=args.prompt_batch_size,
+            seed=args.base_seed,
+            dataset_size=args.sub_dataset_size,
+            judge_model=args.judge_model,
+            judge_mode=args.judge_mode,
+            judge_device=args.judge_device,
+            objective=args.preference_objective,
+            ipo_tau_inv=args.ipo_tau_inv,
+            dpo_beta=args.dpo_beta,
+            pair_normalise=args.pair_normalise,
+        )
     else:
         raise ValueError(f"Unknown task: {args.task}")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    sampling_extra = {}
+    if getattr(task, "is_preference", False):
+        # Pairwise tasks: stochastic samples and per-token logprobs so
+        # cumulative_logprob is populated (vLLM v1 needs logprobs
+        # requested explicitly). The cross objective generates ONE
+        # response per member (pairs form across antithetic twins);
+        # the others generate the pair within each member.
+        assert args.temperature > 0, "preference tasks need temperature > 0 to sample distinct pairs"
+        assert not args.pass_at_k, "pass_at_k is meaningless for preference tasks"
+        wanted = 1 if getattr(task, "cross_pairs", False) else 2
+        if args.samples_per_prompt != wanted:
+            print(f"PREFERENCE: forcing samples_per_prompt={wanted} (was {args.samples_per_prompt})", flush=True)
+            args.samples_per_prompt = wanted
+        if getattr(task, "cross_pairs", False):
+            assert args.population_size % 2 == 0, "cross objective needs an even population"
+        sampling_extra["logprobs"] = 0
     sampling_params = SamplingParams(
         temperature=args.temperature,
         seed=args.base_seed,
         max_tokens=args.max_tokens,
         n=args.samples_per_prompt,
         stop=[tokenizer.eos_token, "<|im_end|>", "<|endoftext|>"],
+        **sampling_extra,
     )
     do_eval = False
     if "math:" in args.task and args.steps_per_eval > 0:
@@ -1559,7 +1921,8 @@ def main(args: Args):
                 lora_requests=engine_batch_lora_reqs,
                 task_obj=task_ref,
                 answers=answers_ref,
-                args=args
+                args=args,
+                es_step=es_step
             )
             all_refs.append(ref)
             
