@@ -4,17 +4,18 @@
 For each run's latest checkpoint: unfuse the merged vLLM weights into
 a transformers model (via merge_checkpoint.unfuse_vllm_to_transformers),
 generate one summary per held-out post with the trained and the initial
-model (same seed), and score both with the reward-model judge (soft
-mode). Reports win_rate = fraction of posts where
-P(trained > initial) > 0.5.
+model, with decoding matched to training (a "\nTL;DR:" cue, a newline
+stop, full-distribution sampling), and score both with the reward-model
+judge. PRIMARY metric is mean_p = mean P(trained > initial); 0.5 is the
+null. win_rate (ties credited 0.5) is secondary. Both come with 95% CIs
+-- at small n they usually straddle 0.5, so use --n >= 500.
 
-Held-out prompts are taken from beyond the training slice (training
-used the first --train-slice rows of the corpus).
+Held-out prompts are taken from beyond the training slice AND are
+text-excluded from it (the corpus repeats posts across rows).
 
     python eval_qwen_winrate.py \
-        --run-dir "$SCRATCH/for_es_lora/experiments/qwen06b_maxlot_seed0-*" \
-        --run-dir "$SCRATCH/for_es_lora/experiments/qwen06b_ipo_seed0-*" \
-        --n 50 --out winrates_qwen.json
+        --run-dir "$SCRATCH/for_es_lora/experiments/qwen06b_dpo_normstd_beta5_seed0-*" \
+        --n 500 --out winrates_qwen.json
 """
 
 import argparse
@@ -84,8 +85,12 @@ def main():
     ap.add_argument("--repo", default="CarperAI/openai_summarize_comparisons")
     ap.add_argument("--train-slice", type=int, default=2000,
                     help="rows used in training; held-out starts after this")
-    ap.add_argument("--n", type=int, default=50)
+    ap.add_argument("--n", type=int, default=500,
+                    help="held-out prompts; CI ~ +/-0.5/sqrt(n) (~0.044 at 500, ~0.098 at 100)")
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--prompt-suffix", default="\nTL;DR:",
+                    help="cue appended to every prompt; MUST match the task's "
+                         "prompt_suffix (preference_tasks.py) so eval == train")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
@@ -98,16 +103,20 @@ def main():
     from datasets import load_dataset
     rows = load_dataset(args.repo, split="train")
     prompts = []
-    seen = set()
+    # The comparisons corpus repeats posts across rows. Seed the dedupe set
+    # with EVERY training-slice post (by text) so a memorised post can't leak
+    # into the held-out set, then dedupe the held-out posts among themselves.
+    seen = {rows[j]["prompt"] for j in range(min(args.train_slice, len(rows)))}
     i = args.train_slice
-    # The comparisons corpus repeats posts across rows; dedupe so the
-    # N held-out prompts are N distinct posts.
     while len(prompts) < args.n and i < len(rows):
         p = rows[i]["prompt"]
         if p not in seen:
             seen.add(p)
-            prompts.append(p)
+            prompts.append(p + args.prompt_suffix)  # cue, exactly like training
         i += 1
+    if len(prompts) < args.n:
+        print(f"warn: only {len(prompts)} distinct held-out prompts available "
+              f"(< requested {args.n}); CI widens accordingly")
 
     judge_tok = AutoTokenizer.from_pretrained(args.judge_model)
     judge = AutoModelForSequenceClassification.from_pretrained(args.judge_model)
@@ -125,11 +134,18 @@ def main():
                         max_length=448).to(device)
         with torch.no_grad():
             out = model.generate(
-                **ids, max_new_tokens=args.max_new_tokens, do_sample=True,
-                temperature=args.temperature, pad_token_id=tokenizer.eos_token_id,
+                **ids, max_new_tokens=args.max_new_tokens, min_new_tokens=4,
+                do_sample=True, temperature=args.temperature,
+                # Match training's vLLM SamplingParams: full distribution
+                # (top_k/top_p disabled) and stop at the first newline so a
+                # one-line TL;DR doesn't run on into garbage the judge scores.
+                top_p=1.0, top_k=0,
+                stop_strings=["\n"], tokenizer=tokenizer,
+                pad_token_id=tokenizer.eos_token_id,
             )
-        return tokenizer.decode(out[0][ids["input_ids"].shape[1]:],
+        text = tokenizer.decode(out[0][ids["input_ids"].shape[1]:],
                                 skip_special_tokens=True)
+        return text.rstrip("\n")  # HF keeps the stop string; vLLM strips it
 
     print(f"loading initial model {args.model_name}")
     base = AutoModelForCausalLM.from_pretrained(
@@ -161,32 +177,40 @@ def main():
             p = 1.0 / (1.0 + math.exp(-(reward(prompt + trained_text)
                                         - reward(prompt + ref_text))))
             probs.append(p)
-            # A tie is NOT a loss. When the model barely moved, trained and
-            # reference generations are identical -> equal judge reward ->
-            # p == 0.5 exactly; counting that as a loss floors a non-moving
-            # model near (1 - tie_rate) * 0.5 (~0.40 at tie_rate 0.2). Give
-            # ties half credit; mean_p below is the tie-immune companion.
-            if p > 0.5:
-                wins += 1.0
-            elif p == 0.5:
+            # Identical generations (the model barely moved) are a genuine tie,
+            # not a loss: half credit. Scoring them as losses floors a non-moving
+            # model near (1 - tie_rate) * 0.5. mean_p is the tie-immune headline.
+            if trained_text == ref_text:
                 wins += 0.5
                 ties += 1
-            if i < 3:
+            elif p > 0.5:
+                wins += 1.0
+            if i < 10:
                 samples.append({"prompt_tail": prompt[-120:],
                                 "trained": trained_text, "initial": ref_text,
                                 "p": round(p, 3)})
         base.load_state_dict(base_state)  # clean slate for next run
+        n = len(prompts)
+        mean_p = sum(probs) / n
+        win_rate = wins / n
+        # 95% CIs (normal approx): win_rate binomial, mean_p from sample std.
+        wr_ci = 1.96 * math.sqrt(win_rate * (1 - win_rate) / n) if n else 0.0
+        p_std = (sum((x - mean_p) ** 2 for x in probs) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        mp_ci = 1.96 * p_std / math.sqrt(n) if n else 0.0
         results[os.path.basename(run_dir)] = {
             "checkpoint": os.path.basename(ckpt),
-            "win_rate": wins / len(prompts),
-            "mean_p": sum(probs) / len(probs),
+            "mean_p": mean_p,            # PRIMARY metric; 0.5 is the null
+            "mean_p_ci95": mp_ci,
+            "win_rate": win_rate,        # secondary; ties credited 0.5
+            "win_rate_ci95": wr_ci,
             "ties": ties,
-            "tie_rate": ties / len(prompts),
-            "n": len(prompts),
+            "tie_rate": ties / n,
+            "n": n,
+            "probs": [round(x, 4) for x in probs],  # for post-hoc CIs / bootstrap
             "samples": samples,
         }
-        print(f"  win_rate={wins/len(prompts):.3f} mean_p={sum(probs)/len(probs):.3f} "
-              f"ties={ties}/{len(prompts)}")
+        print(f"  mean_p={mean_p:.3f} +/-{mp_ci:.3f} | "
+              f"win_rate={win_rate:.3f} +/-{wr_ci:.3f} | ties={ties}/{n}")
 
     if args.out:
         with open(args.out, "w") as fh:
