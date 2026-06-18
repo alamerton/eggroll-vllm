@@ -150,7 +150,7 @@ def main():
         missing, unexpected = base.load_state_dict(unfused, strict=False)
         print(f"  loaded ({len(missing)} missing, {len(unexpected)} unexpected keys)")
 
-        wins, probs, samples = 0, [], []
+        wins, ties, probs, samples = 0.0, 0, [], []
         for i, prompt in enumerate(prompts):
             seed = args.seed * 100003 + i
             trained_text = generate(base, prompt, seed)   # base now holds trained weights
@@ -161,7 +161,16 @@ def main():
             p = 1.0 / (1.0 + math.exp(-(reward(prompt + trained_text)
                                         - reward(prompt + ref_text))))
             probs.append(p)
-            wins += p > 0.5
+            # A tie is NOT a loss. When the model barely moved, trained and
+            # reference generations are identical -> equal judge reward ->
+            # p == 0.5 exactly; counting that as a loss floors a non-moving
+            # model near (1 - tie_rate) * 0.5 (~0.40 at tie_rate 0.2). Give
+            # ties half credit; mean_p below is the tie-immune companion.
+            if p > 0.5:
+                wins += 1.0
+            elif p == 0.5:
+                wins += 0.5
+                ties += 1
             if i < 3:
                 samples.append({"prompt_tail": prompt[-120:],
                                 "trained": trained_text, "initial": ref_text,
@@ -171,10 +180,13 @@ def main():
             "checkpoint": os.path.basename(ckpt),
             "win_rate": wins / len(prompts),
             "mean_p": sum(probs) / len(probs),
+            "ties": ties,
+            "tie_rate": ties / len(prompts),
             "n": len(prompts),
             "samples": samples,
         }
-        print(f"  win_rate={wins/len(prompts):.3f} mean_p={sum(probs)/len(probs):.3f}")
+        print(f"  win_rate={wins/len(prompts):.3f} mean_p={sum(probs)/len(probs):.3f} "
+              f"ties={ties}/{len(prompts)}")
 
     if args.out:
         with open(args.out, "w") as fh:
