@@ -79,6 +79,12 @@ class TldrPreferenceTask:
             draw prompts from (only the prompt column is used; the
             human-written summaries are not shown to the policy).
         prompt_column: prompt column name on the HF rows.
+        prompt_suffix: appended to every prompt so the policy is cued to
+            SUMMARISE rather than continue the post. The CarperAI prompts
+            end at the post body with no cue, so the model just keeps
+            writing the post; "\nTL;DR:" is the canonical completion
+            format and the judge scores prompt+response, so the cue is
+            seen consistently on both sides. Pass "" to disable.
         judge_model: HF repo id of the sequence-classification reward
             model used as the pairwise judge.
         judge_mode: "soft" (return sigmoid(r_a - r_b)), "hard"
@@ -104,6 +110,7 @@ class TldrPreferenceTask:
         split="train",
         dataset_size=None,
         prompt_column="prompt",
+        prompt_suffix="\nTL;DR:",
         judge_model="OpenAssistant/reward-model-deberta-v3-base",
         judge_mode="bernoulli",
         judge_max_length=512,
@@ -163,7 +170,8 @@ class TldrPreferenceTask:
                 f"rows are missing column {prompt_column!r}; got keys "
                 f"{list(row_dicts[0].keys())}"
             )
-        self.prompts = [r[prompt_column] for r in row_dicts]
+        self.prompt_suffix = str(prompt_suffix)
+        self.prompts = [r[prompt_column] + self.prompt_suffix for r in row_dicts]
 
         # The judge is heavyweight and CUDA-bound; load lazily and keep
         # it out of the pickled state (see __getstate__).
