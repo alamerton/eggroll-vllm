@@ -1643,6 +1643,7 @@ def main(args: Args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     sampling_extra = {}
+    stop_strs = [tokenizer.eos_token, "<|im_end|>", "<|endoftext|>"]
     if getattr(task, "is_preference", False):
         # Pairwise tasks: stochastic samples and per-token logprobs so
         # cumulative_logprob is populated (vLLM v1 needs logprobs
@@ -1658,12 +1659,19 @@ def main(args: Args):
         if getattr(task, "cross_pairs", False):
             assert args.population_size % 2 == 0, "cross objective needs an even population"
         sampling_extra["logprobs"] = 0
+        # A TL;DR summary is a single line. Without a newline stop the
+        # policy emits a good summary then runs on into repetitive garbage
+        # (100% truncation, and the judge scores summary+junk, muddying the
+        # preference signal). Stop at the first newline; min_tokens guards
+        # against an immediate empty stop if a sample opens with a newline.
+        stop_strs.append("\n")
+        sampling_extra["min_tokens"] = 4
     sampling_params = SamplingParams(
         temperature=args.temperature,
         seed=args.base_seed,
         max_tokens=args.max_tokens,
         n=args.samples_per_prompt,
-        stop=[tokenizer.eos_token, "<|im_end|>", "<|endoftext|>"],
+        stop=stop_strs,
         **sampling_extra,
     )
     do_eval = False
