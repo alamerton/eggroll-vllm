@@ -91,6 +91,7 @@ class Args:
     base_seed: int = 0
     sub_dataset_size: int = None
     steps_per_eval: int = 10 # -1 to disable
+    eval_n: int = 128  # held-out posts for the preference win-rate-vs-init eval
     eval_batch_size: int = 128
     es_update_chunk_size: int = None  # Auto-select based on lora_r if None
 
@@ -1076,6 +1077,17 @@ class ESNcclLLM(LLM):
 
         return fitness_list, info, responses_for_logging
 
+    def eval_winrate_rewards(self, prompts, sampling_params, task_obj):
+        """Win-rate-eval support: generate ONE summary per held-out prompt with
+        the current merged policy (no adapter) and return the judge reward for
+        each prompt+summary, plus the summaries. The driver compares these to
+        the cached step-0 (initial-model) rewards to form win_rate/mean_p. Runs
+        here because the reward model lives on the engine."""
+        outputs = self.generate(prompts, sampling_params, lora_request=None, use_tqdm=False)
+        summaries = [o.outputs[0].text for o in outputs]
+        rewards = [task_obj.reward(p + s) for p, s in zip(prompts, summaries)]
+        return rewards, summaries
+
     def generate_and_score_preference(self, prompts, sampling_params, lora_requests, task_obj, answers, args, es_step=0):
         """Pairwise-preference variant of generate_and_score.
 
@@ -1399,6 +1411,48 @@ def load_checkpoint(checkpoint_path: str):
         "fitnesses_so_far": state.get("fitnesses_so_far", []),
     }
 
+def _stable_sigmoid(x):
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def _run_winrate_eval(engines, heldout_prompts, sampling_params, task_ref, args, init_rewards):
+    """Held-out win-rate vs the initial model, out of 100. Splits the (fixed)
+    held-out prompts across engines, generates + judges on each, and returns
+    (win_rate, mean_p, rewards, summaries). If init_rewards is None this is the
+    step-0 pass (current policy == initial model): win_rate is 50 by
+    construction and the returned rewards should be cached as the baseline."""
+    per = math.ceil(len(heldout_prompts) / args.num_engines)
+    refs = []
+    for ei in range(args.num_engines):
+        chunk = heldout_prompts[ei * per:(ei + 1) * per]
+        if chunk:
+            refs.append(engines[ei].eval_winrate_rewards.remote(chunk, sampling_params, task_ref))
+    rewards, summaries = [], []
+    for r, s in ray.get(refs):
+        rewards.extend(r)
+        summaries.extend(s)
+    if init_rewards is None:
+        return 50.0, 50.0, rewards, summaries
+    probs = [_stable_sigmoid(c - i) for c, i in zip(rewards, init_rewards)]
+    wins = sum(1.0 if p > 0.5 else (0.5 if p == 0.5 else 0.0) for p in probs)
+    return 100.0 * wins / len(probs), 100.0 * sum(probs) / len(probs), rewards, summaries
+
+
+def _append_winrate_history(run_dir, es_step, win_rate, mean_p, n):
+    """Append one win-rate eval point to <run_dir>/winrate_history.jsonl for
+    offline plotting (plotting_scripts/plot_winrate.py)."""
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "winrate_history.jsonl"), "a") as fh:
+            fh.write(json.dumps({"es_step": es_step, "win_rate": win_rate,
+                                 "mean_p": mean_p, "n": n}) + "\n")
+    except Exception as e:
+        print(f"WARN: could not write winrate history: {e}", flush=True)
+
+
 def main(args: Args):
     print("MAIN: Entered main function", flush=True)
     sys.stdout.flush()
@@ -1630,6 +1684,7 @@ def main(args: Args):
             batch_size=args.prompt_batch_size,
             seed=args.base_seed,
             dataset_size=args.sub_dataset_size,
+            eval_heldout_size=(args.eval_n if args.steps_per_eval > 0 else 0),
             judge_model=args.judge_model,
             judge_mode=args.judge_mode,
             judge_device=args.judge_device,
@@ -1673,6 +1728,17 @@ def main(args: Args):
         n=args.samples_per_prompt,
         stop=stop_strs,
         **sampling_extra,
+    )
+    # One-summary decode for the in-loop win-rate eval: same stop/min_tokens as
+    # training but n=1 (one held-out summary per post), fixed seed so the only
+    # thing changing across eval points is the policy.
+    eval_winrate_sp = SamplingParams(
+        temperature=args.temperature,
+        seed=args.base_seed,
+        max_tokens=args.max_tokens,
+        n=1,
+        stop=stop_strs,
+        min_tokens=sampling_extra.get("min_tokens", 0),
     )
     do_eval = False
     if "math:" in args.task and args.steps_per_eval > 0:
@@ -1795,6 +1861,10 @@ def main(args: Args):
     total_time = time.time()
     force_regen_adapters = (start_step > 0)  # Force regeneration on first step if resuming
 
+    # In-loop win-rate-vs-init eval state (preference tasks only).
+    init_eval_rewards = None  # cached step-0 (initial-model) judge rewards
+    winrate_task_ref = ray.put(task) if getattr(task, "is_preference", False) else None
+
     for es_step in range(start_step, args.num_iterations):
         print(f"\n\n======= ES Step {es_step} / {args.num_iterations} =======")
         total_iter_start = time.time()
@@ -1855,6 +1925,26 @@ def main(args: Args):
             print(f"--------------------------------\n")
             eval_time = time.time() - eval_start
             if args.verbose: print(f"EVAL complete in {eval_time:.4f}s")
+
+        # --- PREFERENCE WIN-RATE EVAL vs the initial model ---
+        # Generate held-out summaries with the current merged policy, judge them
+        # against the cached step-0 (initial-model) rewards, log to wandb (under
+        # eval/) and to winrate_history.jsonl. Step 0 caches the baseline.
+        if (args.steps_per_eval > 0
+                and (es_step % args.steps_per_eval == 0 or es_step == args.num_iterations - 1)
+                and getattr(task, "is_preference", False)
+                and getattr(task, "heldout_prompts", None)):
+            wr_start = time.time()
+            wr, mp, rewards, _ = _run_winrate_eval(
+                engines, task.heldout_prompts, eval_winrate_sp,
+                winrate_task_ref, args, init_eval_rewards)
+            if init_eval_rewards is None:
+                init_eval_rewards = rewards  # step 0 == initial model -> baseline
+            eval_info_dict_all["eval/win_rate"] = wr
+            eval_info_dict_all["eval/mean_p"] = mp
+            print(f"WIN-RATE EVAL step {es_step}: win_rate={wr:.1f} mean_p={mp:.1f} "
+                  f"(n={len(rewards)}, {time.time() - wr_start:.1f}s)", flush=True)
+            _append_winrate_history(os.path.dirname(args.checkpoint_dir), es_step, wr, mp, len(rewards))
 
         # 1. Generate local LoRA adapters directly on the workers
         should_generate_adapters = (es_step % args.steps_per_adapter == 0) or force_regen_adapters

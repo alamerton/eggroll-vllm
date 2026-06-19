@@ -109,6 +109,7 @@ class TldrPreferenceTask:
         repo="CarperAI/openai_summarize_comparisons",
         split="train",
         dataset_size=None,
+        eval_heldout_size=0,
         prompt_column="prompt",
         prompt_suffix="\nTL;DR:",
         judge_model="OpenAssistant/reward-model-deberta-v3-base",
@@ -154,15 +155,29 @@ class TldrPreferenceTask:
         self.cross_pairs = objective == "cross"
         self.rng = np.random.default_rng(seed)
 
+        self.eval_heldout_size = int(eval_heldout_size)
+        heldout_dicts = []
         if rows is not None:
             row_dicts = [dict(r) for r in rows]
         else:
             from datasets import load_dataset
 
             hf = load_dataset(repo, split=split)
-            if dataset_size is not None:
-                hf = hf.select(range(min(dataset_size, len(hf))))
-            row_dicts = list(hf)
+            train_end = min(dataset_size, len(hf)) if dataset_size is not None else len(hf)
+            row_dicts = list(hf.select(range(train_end)))
+            # Held-out eval set for the win-rate-vs-init curve: distinct prompts
+            # BEYOND the training slice, excluding any whose text also appears in
+            # training (the corpus repeats posts across rows). Fixed, so the
+            # curve is comparable across steps.
+            if self.eval_heldout_size > 0 and train_end < len(hf):
+                seen = {r[prompt_column] for r in row_dicts}
+                for j in range(train_end, len(hf)):
+                    r = hf[j]
+                    if r[prompt_column] not in seen:
+                        seen.add(r[prompt_column])
+                        heldout_dicts.append(r)
+                        if len(heldout_dicts) >= self.eval_heldout_size:
+                            break
         if not row_dicts:
             raise ValueError(f"loaded zero rows from {repo!r} split={split!r}")
         if prompt_column not in row_dicts[0]:
@@ -172,6 +187,7 @@ class TldrPreferenceTask:
             )
         self.prompt_suffix = str(prompt_suffix)
         self.prompts = [r[prompt_column] + self.prompt_suffix for r in row_dicts]
+        self.heldout_prompts = [r[prompt_column] + self.prompt_suffix for r in heldout_dicts]
 
         # The judge is heavyweight and CUDA-bound; load lazily and keep
         # it out of the pickled state (see __getstate__).
@@ -230,6 +246,12 @@ class TldrPreferenceTask:
         if self.judge_mode == "hard":
             return 1.0 if p > 0.5 else 0.0
         return 1.0 if _uniform_from_key(key) < p else 0.0
+
+    def reward(self, text):
+        """Raw judge reward for one (prompt+response) text; ensures the judge is
+        loaded. Used by the in-loop win-rate-vs-init eval (runs on the engine)."""
+        self._ensure_judge()
+        return self._score_fn(text)
 
     # ── Task interface ───────────────────────────────────────────────────
     def get_batch(self):
