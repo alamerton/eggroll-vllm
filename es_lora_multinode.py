@@ -92,6 +92,9 @@ class Args:
     sub_dataset_size: int = None
     steps_per_eval: int = 10 # -1 to disable
     eval_n: int = 128  # held-out posts for the preference win-rate-vs-init eval
+    ref_batch_size: int = 8  # DPO/IPO frozen-ref scoring batch; full logits
+                             # (batch x seqlen x vocab~152k) scale with it, so
+                             # raising it trades speed for GPU memory.
     eval_batch_size: int = 128
     es_update_chunk_size: int = None  # Auto-select based on lora_r if None
 
@@ -943,7 +946,10 @@ class ESNcclLLM(LLM):
             )
 
         scores = []
-        batch = 4  # vocab-sized logits dominate memory; keep batches small
+        # Full per-position logits (batch x seqlen x vocab~152k) dominate
+        # memory, so this stays small. The real win is computing logits only at
+        # the response positions (logits_to_keep) -- a follow-up refactor.
+        batch = getattr(args, "ref_batch_size", 4)
         pos_chunk = 128  # f32 log-softmax in position slices, not full-seq
         with torch.no_grad():
             for start in range(0, len(token_id_seqs), batch):
@@ -1101,6 +1107,7 @@ class ESNcclLLM(LLM):
         same (fitness_list, info, responses_for_logging) shape as the
         scalar path, so the caller's aggregation is unchanged.
         """
+        _t = time.time()
         request_outputs = self.generate(
             prompts,
             sampling_params,
@@ -1108,7 +1115,9 @@ class ESNcclLLM(LLM):
             use_tqdm=True,
         )
 
+        t_gen = time.time() - _t
         num_prompts = len(answers)
+        _t = time.time()
 
         # Optional second passes: score the generated responses under
         # the unperturbed *current* base (maxlot's pibar, via the engine
@@ -1161,6 +1170,8 @@ class ESNcclLLM(LLM):
         mean_token_lengths = []
         pop_responses_buffer = ""
 
+        t_score = time.time() - _t
+        _t = time.time()
         for i, output in enumerate(request_outputs):
             prompt_idx = i % num_prompts
             pop_idx = i // num_prompts
@@ -1214,12 +1225,17 @@ class ESNcclLLM(LLM):
                     f"-----POP {pop_idx} BATCH LOG-----\n" + pop_responses_buffer
                 )
                 pop_responses_buffer = ""
+        t_judge = time.time() - _t
 
+        print(f"SUBPHASE(s): gen {t_gen:.1f} | score[base/ref] {t_score:.1f} | judge {t_judge:.1f}", flush=True)
         info = {
             "total_responses": total_responses,
             "prop_truncated": num_truncated / total_responses if total_responses > 0 else 0.0,
             "mean_char_length": np.mean(mean_char_lengths),
             "mean_token_length": np.mean(mean_token_lengths),
+            "time/gen": t_gen,
+            "time/score": t_score,
+            "time/judge": t_judge,
         }
         for k, v in all_task_info.items():
             info[k] = float(np.mean(v))
