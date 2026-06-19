@@ -1172,6 +1172,17 @@ class ESNcclLLM(LLM):
 
         t_score = time.time() - _t
         _t = time.time()
+        # Batch the judge over the whole population in one pass (was 1 forward
+        # per text -> ~2*pop*prompts batch-1 calls). Collect the pair texts +
+        # bernoulli keys, score once, then the fitness loop reuses the prefs.
+        _bp, _ba, _bb, _bk = [], [], [], []
+        for _oi, _out in enumerate(request_outputs):
+            _o = _out.outputs
+            _bp.append(prompts[_oi])
+            _ba.append(_o[0].text)
+            _bb.append(_o[1].text)
+            _bk.append((args.base_seed, es_step, _oi % num_prompts, _o[0].text, _o[1].text))
+        precomputed_ps = task_obj.batch_score_pairs(_bp, _ba, _bb, _bk)
         for i, output in enumerate(request_outputs):
             prompt_idx = i % num_prompts
             pop_idx = i // num_prompts
@@ -1203,6 +1214,7 @@ class ESNcclLLM(LLM):
                 pair_base_scores,
                 pair_ref_scores,
                 key,
+                precomputed_p=precomputed_ps[i],
             )
             fitness_list.append(fit)
 

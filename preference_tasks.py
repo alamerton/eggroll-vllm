@@ -199,6 +199,9 @@ class TldrPreferenceTask:
         state = dict(self.__dict__)
         if not self._injected_score_fn:
             state["_score_fn"] = None
+        # never pickle the heavy judge to the engines; each reloads its own.
+        state["_judge_model"] = None
+        state["_judge_tokenizer"] = None
         return state
 
     def __setstate__(self, state):
@@ -219,6 +222,11 @@ class TldrPreferenceTask:
         model = AutoModelForSequenceClassification.from_pretrained(self.judge_model)
         model.to(device)
         model.eval()
+        # Keep handles so the population can be scored in batched forward passes
+        # (see _batch_rewards), not one text at a time.
+        self._judge_tokenizer = tokenizer
+        self._judge_model = model
+        self._judge_device = device
 
         def hf_score(text):
             with torch.no_grad():
@@ -253,6 +261,53 @@ class TldrPreferenceTask:
         self._ensure_judge()
         return self._score_fn(text)
 
+    def _batch_rewards(self, texts, batch_size=64):
+        """Judge rewards for many (prompt+response) texts in batched forward
+        passes. The population is ~2*pop*prompts texts/step; scoring them one at
+        a time (_score_fn) is batch-1 and GPU-starved. Falls back to per-text
+        when a real judge model isn't loaded (injected score_fn in tests)."""
+        self._ensure_judge()
+        if getattr(self, "_judge_model", None) is None:
+            return [self._score_fn(t) for t in texts]
+        import torch
+
+        rewards = []
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            with torch.no_grad():
+                inputs = self._judge_tokenizer(
+                    chunk,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.judge_max_length,
+                    padding=True,
+                ).to(self._judge_device)
+                logits = self._judge_model(**inputs).logits
+            # (batch, num_labels); last column is the scalar reward (mirrors
+            # hf_score's logits[0, -1]). The attention mask makes padding inert.
+            rewards.extend(logits[:, -1].float().tolist())
+        return rewards
+
+    def batch_score_pairs(self, prompts, responses_a, responses_b, keys):
+        """Vectorised score_pair: ONE batched judge pass over all the a-texts and
+        b-texts, then P(a preferred over b) per pair under the configured judge
+        mode. Returns the same values score_pair would (modulo float noise from
+        batched matmul). The expensive judge forward is done once, not 2*N times."""
+        n = len(prompts)
+        texts = [prompts[i] + responses_a[i] for i in range(n)]
+        texts += [prompts[i] + responses_b[i] for i in range(n)]
+        rewards = self._batch_rewards(texts)
+        out = []
+        for i in range(n):
+            p = _sigmoid(rewards[i] - rewards[n + i])
+            if self.judge_mode == "soft":
+                out.append(p)
+            elif self.judge_mode == "hard":
+                out.append(1.0 if p > 0.5 else 0.0)
+            else:  # bernoulli: deterministic keyed coin, exactly like score_pair
+                out.append(1.0 if _uniform_from_key(keys[i]) < p else 0.0)
+        return out
+
     # ── Task interface ───────────────────────────────────────────────────
     def get_batch(self):
         indices = self.rng.integers(0, len(self.prompts), size=self.batch_size)
@@ -269,6 +324,7 @@ class TldrPreferenceTask:
         base_logprobs,
         ref_logprobs,
         key,
+        precomputed_p=None,
     ):
         """Fitness for one (population member, prompt) response pair.
 
@@ -293,7 +349,8 @@ class TldrPreferenceTask:
             ``(fitness, info)`` with per-pair diagnostics in ``info``.
         """
         response_a, response_b = responses
-        p = self.score_pair(prompt, response_a, response_b, key)
+        p = (precomputed_p if precomputed_p is not None
+             else self.score_pair(prompt, response_a, response_b, key))
         s = 2.0 * p - 1.0
         info = {"pref_p": p}
         if self.objective == "naive":
