@@ -5,3 +5,7 @@ core
 des/
 tmp/
 sampling_outputs/
+$SCRATCH/
+
+# eval outputs (eval_qwen_winrate.py)
+winrates_*.json
